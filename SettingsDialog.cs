@@ -91,6 +91,7 @@ namespace JzeroCompilerNativeLite
         private readonly OffsetTextButton okButton;
         private readonly OffsetTextButton cancelButton;
         private readonly OffsetTextButton resetButton;
+        private readonly FlowLayoutPanel actionsPanel;
 
         internal EditorSettings Result { get; private set; }
 
@@ -188,7 +189,7 @@ namespace JzeroCompilerNativeLite
             outputSizeValue = CreateValueLabel();
             settingsLayout.Controls.Add(CreateSliderRow("Output Size", outputSizeSlider, outputSizeValue), 0, 5);
 
-            shortcutsHeaderLabel = CreateSectionLabel("Shortcuts");
+            shortcutsHeaderLabel = CreateSectionLabel("Controls & Shortcuts");
             shortcutsHeaderLabel.Margin = new Padding(0);
             settingsLayout.Controls.Add(shortcutsHeaderLabel, 0, 6);
 
@@ -201,16 +202,27 @@ namespace JzeroCompilerNativeLite
             shortcutsBox.BorderStyle = BorderStyle.FixedSingle;
             shortcutsBox.Font = new Font("Consolas", 9F);
             shortcutsBox.Text =
-                "Keyboard shortcuts" + Environment.NewLine +
+                "Keyboard shortcuts and current controls" + Environment.NewLine +
                 "Ctrl+S  Save active file" + Environment.NewLine +
                 "Ctrl+W  Close active tab" + Environment.NewLine +
                 "Ctrl+Z  Undo" + Environment.NewLine +
                 "Ctrl+Y  Redo" + Environment.NewLine +
                 "Ctrl+B  Hide/show workspace" + Environment.NewLine +
-                "F5      Compile + Run" + Environment.NewLine +
+                "Ctrl+R  Reload active file from disk" + Environment.NewLine +
+                "Ctrl+Space  Show autocomplete" + Environment.NewLine +
+                "F5      Compile (press again to stop/restart)" + Environment.NewLine +
                 "Tab     Indent (editor control default)" + Environment.NewLine +
-                "Double-click file in workspace to open" + Environment.NewLine +
-                "Right-click file/folder for menu and Reveal in Explorer";
+                Environment.NewLine +
+                "Workspace controls" + Environment.NewLine +
+                "Back / Up / Root / Refresh in workspace header" + Environment.NewLine +
+                "Double-click folder to enter it" + Environment.NewLine +
+                "Drag files onto folders to move them" + Environment.NewLine +
+                "Drag onto Up, Root, or the path strip to move upward/out" + Environment.NewLine +
+                "Right-click file/folder for menu and Reveal in Explorer" + Environment.NewLine +
+                Environment.NewLine +
+                "Toolbar controls" + Environment.NewLine +
+                "Compile button is the main action" + Environment.NewLine +
+                "Stop turns red only while compile/run is active";
             settingsLayout.Controls.Add(shortcutsBox, 0, 7);
 
             var previewLayout = new TableLayoutPanel();
@@ -265,8 +277,6 @@ namespace JzeroCompilerNativeLite
             okButton.Text = "Apply";
             okButton.DialogResult = DialogResult.OK;
             okButton.Size = new Size(110, 34);
-            okButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            okButton.Location = new Point(832, 10);
             okButton.FlatStyle = FlatStyle.Flat;
             okButton.BackColor = Color.FromArgb(0, 102, 204);
             okButton.ForeColor = Color.White;
@@ -279,8 +289,6 @@ namespace JzeroCompilerNativeLite
             cancelButton.Text = "Cancel";
             cancelButton.DialogResult = DialogResult.Cancel;
             cancelButton.Size = new Size(110, 34);
-            cancelButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            cancelButton.Location = new Point(952, 10);
             cancelButton.FlatStyle = FlatStyle.Flat;
             cancelButton.BackColor = Color.FromArgb(52, 52, 52);
             cancelButton.ForeColor = Color.White;
@@ -312,9 +320,20 @@ namespace JzeroCompilerNativeLite
                 UpdatePreview();
             };
 
+            actionsPanel = new FlowLayoutPanel();
+            actionsPanel.Dock = DockStyle.Right;
+            actionsPanel.AutoSize = true;
+            actionsPanel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            actionsPanel.WrapContents = false;
+            actionsPanel.FlowDirection = FlowDirection.LeftToRight;
+            actionsPanel.Padding = new Padding(0, 10, 10, 0);
+            actionsPanel.BackColor = Color.Transparent;
+
+            actionsPanel.Controls.Add(okButton);
+            actionsPanel.Controls.Add(cancelButton);
+
             buttonsPanel.Controls.Add(resetButton);
-            buttonsPanel.Controls.Add(okButton);
-            buttonsPanel.Controls.Add(cancelButton);
+            buttonsPanel.Controls.Add(actionsPanel);
 
             AcceptButton = okButton;
             CancelButton = cancelButton;
@@ -366,6 +385,7 @@ namespace JzeroCompilerNativeLite
             settingsPanel.BackColor = palette.PanelBack;
             previewPanel.BackColor = palette.PanelBack;
             buttonsPanel.BackColor = palette.WindowBack;
+            actionsPanel.BackColor = Color.Transparent;
             appearanceHeaderLabel.ForeColor = palette.Text;
             shortcutsHeaderLabel.ForeColor = palette.Text;
             editorPreviewHeaderLabel.ForeColor = palette.Text;

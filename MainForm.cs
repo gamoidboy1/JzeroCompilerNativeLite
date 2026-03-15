@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -42,19 +43,45 @@ namespace JzeroCompilerNativeLite
         private List<string> recentFiles = new List<string>();
         private string lastSelectedFilePath;
         private Process currentProcess;
+        private Process compileProcess;
+        private CompileRequest activeCompileRequest;
+        private bool restartExecutionRequested;
+        private bool stopRequested;
         private int terminalInputStart;
         private int terminalWidthPercent = 45;
+        private string currentWorkspaceDirectory;
+        private readonly List<string> workspaceHistory = new List<string>();
+        private int workspaceHistoryIndex = -1;
+        private bool suppressDocumentDirtyTracking;
+        private bool suppressWorkspaceHistoryPush;
+        private bool suppressAutocompleteUpdates;
+        private bool suppressAutocompleteCommitErrors;
+        private string workspaceDropHighlightPath;
+        private bool workspaceUpDropHighlighted;
+        private bool workspaceRootDropHighlighted;
+        private bool workspaceLabelDropHighlighted;
+        private FastColoredTextBox autocompleteEditor;
+        private ToolStripDropDown autocompletePopup;
+        private ListBox autocompleteList;
+        private int autocompleteReplaceStart = -1;
+        private int autocompleteReplaceLength;
 
-        private TreeView fileTree;
+        private WorkspaceListView workspaceList;
+        private ImageList workspaceRowHeightImageList;
         private TextBox searchBox;
         private Label workspaceLabel;
+        private Label workspaceHintLabel;
         private TabControl editorTabs;
         private Panel emptyEditorPanel;
-        private RichTextBox terminalBox;
+        private HiddenScrollRichTextBox terminalBox;
         private SplitContainer workspaceSplit;
         private SplitContainer editorTerminalSplit;
         private Label statusLabel;
         private Button workspaceButton;
+        private Button workspaceBackButton;
+        private Button workspaceRootButton;
+        private Button workspaceUpButton;
+        private Button workspaceRefreshButton;
         private Button newFileButton;
         private Button recentFilesButton;
         private Button saveButton;
@@ -67,6 +94,13 @@ namespace JzeroCompilerNativeLite
         private int workspaceSplitterDistance = 320;
         private int terminalSplitterDistance = 760;
         private readonly Dictionary<string, ThemePalette> themes = CreateThemes();
+        private readonly string[] autocompleteSnippets =
+        {
+            "printf", "scanf", "fprintf", "fscanf", "snprintf", "sprintf", "puts", "gets",
+            "main", "#include", "return", "malloc", "calloc", "realloc", "free", "memset",
+            "memcpy", "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "fopen", "fclose",
+            "fgets", "fputs", "FILE", "size_t", "stdin", "stdout", "stderr", "NULL"
+        };
 
         private static Dictionary<string, ThemePalette> CreateThemes()
         {
@@ -236,6 +270,7 @@ namespace JzeroCompilerNativeLite
                 "JzeroCompilerNativeLite");
             configPath = Path.Combine(configDirectory, "config.json");
             workspacePath = GetDefaultWorkspace();
+            currentWorkspaceDirectory = workspacePath;
             LoadConfig();
 
             autoSaveTimer = new System.Windows.Forms.Timer();
@@ -243,6 +278,7 @@ namespace JzeroCompilerNativeLite
             autoSaveTimer.Tick += AutoSaveTimerTick;
 
             BuildUi();
+            InitializeAutocomplete();
             ApplyEditorSettings(new EditorSettings
             {
                 ThemeName = themeName,
@@ -264,11 +300,19 @@ namespace JzeroCompilerNativeLite
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(1380, 820);
             Size = new Size(1500, 900);
+            try
+            {
+                Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch
+            {
+            }
             BackColor = Color.FromArgb(10, 10, 10);
             ForeColor = Color.FromArgb(228, 228, 228);
             Font = new Font("Segoe UI", 9F);
             KeyPreview = true;
             KeyDown += MainFormKeyDown;
+            Resize += MainFormResize;
 
             var root = new TableLayoutPanel();
             root.Dock = DockStyle.Fill;
@@ -318,7 +362,7 @@ namespace JzeroCompilerNativeLite
             workspaceButton.Click += WorkspaceButtonClick;
 
             newFileButton = CreateButton("New", 70, Color.FromArgb(34, 34, 34));
-            newFileButton.Click += delegate { CreateItem(false, workspacePath); };
+            newFileButton.Click += delegate { CreateItem(false, string.IsNullOrWhiteSpace(currentWorkspaceDirectory) ? workspacePath : currentWorkspaceDirectory); };
 
             saveButton = CreateButton("Save", 80, Color.FromArgb(34, 34, 34));
             saveButton.Click += SaveButtonClick;
@@ -333,10 +377,10 @@ namespace JzeroCompilerNativeLite
             autoClearButton.Click += AutoClearButtonClick;
             UpdateAutoClearButton();
 
-            stopButton = CreateButton("Stop", 80, Color.FromArgb(132, 32, 32));
+            stopButton = CreateButton("Stop", 80, Color.FromArgb(80, 80, 80));
             stopButton.Click += StopButtonClick;
 
-            runButton = CreateButton("Compile + Run", 120, Color.FromArgb(0, 102, 204));
+            runButton = CreateButton("Compile", 100, Color.FromArgb(0, 102, 204));
             runButton.Click += RunButtonClick;
 
             caretLabel = new Label();
@@ -371,6 +415,7 @@ namespace JzeroCompilerNativeLite
             rightButtons.Controls.Add(autoClearButton);
             rightButtons.Controls.Add(stopButton);
             rightButtons.Controls.Add(runButton);
+            UpdateStopButtonState();
 
             bar.Controls.Add(title);
             bar.Controls.Add(rightButtons);
@@ -427,6 +472,10 @@ namespace JzeroCompilerNativeLite
             workspaceLabel.BackColor = Color.FromArgb(14, 14, 14);
             workspaceLabel.Padding = new Padding(10, 0, 10, 0);
             workspaceLabel.TextAlign = ContentAlignment.MiddleLeft;
+            workspaceLabel.AllowDrop = true;
+            workspaceLabel.DragEnter += WorkspaceNavDragEnter;
+            workspaceLabel.DragLeave += WorkspaceNavDragLeave;
+            workspaceLabel.DragDrop += WorkspaceLabelDragDrop;
 
             var searchLabel = new Label();
             searchLabel.Text = "Search";
@@ -441,23 +490,81 @@ namespace JzeroCompilerNativeLite
             searchBox.Font = new Font("Segoe UI", 9.5F);
             searchBox.TextChanged += SearchBoxTextChanged;
 
-            var treeHost = new Panel();
-            treeHost.Dock = DockStyle.Fill;
-            treeHost.Padding = new Padding(8);
-            treeHost.BackColor = Color.FromArgb(14, 14, 14);
+            var navPanel = new Panel();
+            navPanel.Dock = DockStyle.Top;
+            navPanel.Height = 34;
+            navPanel.BackColor = Color.Transparent;
 
-            fileTree = new TreeView();
-            fileTree.Dock = DockStyle.Fill;
-            fileTree.BackColor = Color.FromArgb(14, 14, 14);
-            fileTree.ForeColor = Color.FromArgb(228, 228, 228);
-            fileTree.BorderStyle = BorderStyle.FixedSingle;
-            fileTree.HideSelection = false;
-            fileTree.LineColor = Color.FromArgb(56, 56, 56);
-            fileTree.FullRowSelect = true;
-            fileTree.ItemHeight = 22;
-            fileTree.NodeMouseDoubleClick += FileTreeNodeMouseDoubleClick;
-            fileTree.NodeMouseClick += FileTreeNodeMouseClick;
-            treeHost.Controls.Add(fileTree);
+            workspaceBackButton = CreateButton("Back", 68, Color.FromArgb(34, 34, 34));
+            workspaceBackButton.Location = new Point(0, 2);
+            workspaceBackButton.Click += WorkspaceBackButtonClick;
+
+            workspaceUpButton = CreateButton("Up", 58, Color.FromArgb(34, 34, 34));
+            workspaceUpButton.Location = new Point(74, 2);
+            workspaceUpButton.Click += WorkspaceUpButtonClick;
+            workspaceUpButton.AllowDrop = true;
+            workspaceUpButton.DragEnter += WorkspaceNavDragEnter;
+            workspaceUpButton.DragLeave += WorkspaceNavDragLeave;
+            workspaceUpButton.DragDrop += WorkspaceUpButtonDragDrop;
+
+            workspaceRootButton = CreateButton("Root", 64, Color.FromArgb(34, 34, 34));
+            workspaceRootButton.Location = new Point(138, 2);
+            workspaceRootButton.Click += WorkspaceRootButtonClick;
+            workspaceRootButton.AllowDrop = true;
+            workspaceRootButton.DragEnter += WorkspaceNavDragEnter;
+            workspaceRootButton.DragLeave += WorkspaceNavDragLeave;
+            workspaceRootButton.DragDrop += WorkspaceRootButtonDragDrop;
+
+            workspaceRefreshButton = CreateButton("Refresh", 82, Color.FromArgb(34, 34, 34));
+            workspaceRefreshButton.Location = new Point(208, 2);
+            workspaceRefreshButton.Click += delegate { LoadTree(searchBox.Text.Trim(), GetSelectedWorkspacePath()); };
+
+            navPanel.Controls.Add(workspaceBackButton);
+            navPanel.Controls.Add(workspaceUpButton);
+            navPanel.Controls.Add(workspaceRootButton);
+            navPanel.Controls.Add(workspaceRefreshButton);
+
+            workspaceHintLabel = new Label();
+            workspaceHintLabel.Dock = DockStyle.Top;
+            workspaceHintLabel.Height = 22;
+            workspaceHintLabel.ForeColor = Color.FromArgb(134, 134, 134);
+            workspaceHintLabel.Text = "Double-click folders to enter. Drag entries onto folders to move them.";
+            workspaceHintLabel.TextAlign = ContentAlignment.MiddleLeft;
+
+            var listHost = new Panel();
+            listHost.Dock = DockStyle.Fill;
+            listHost.Padding = new Padding(8);
+            listHost.BackColor = Color.FromArgb(14, 14, 14);
+
+            workspaceList = new WorkspaceListView();
+            workspaceList.Dock = DockStyle.Fill;
+            workspaceList.BackColor = Color.FromArgb(14, 14, 14);
+            workspaceList.ForeColor = Color.FromArgb(228, 228, 228);
+            workspaceList.BorderStyle = BorderStyle.FixedSingle;
+            workspaceList.FullRowSelect = true;
+            workspaceList.HideSelection = false;
+            workspaceList.GridLines = false;
+            workspaceList.MultiSelect = false;
+            workspaceList.View = View.Details;
+            workspaceList.HeaderStyle = ColumnHeaderStyle.None;
+            workspaceList.OwnerDraw = true;
+            workspaceList.AllowDrop = true;
+            workspaceList.Columns.Add(string.Empty, 220);
+            workspaceRowHeightImageList = new ImageList();
+            workspaceRowHeightImageList.ImageSize = new Size(1, 34);
+            workspaceList.SmallImageList = workspaceRowHeightImageList;
+            workspaceList.ItemActivate += WorkspaceListItemActivate;
+            workspaceList.MouseUp += WorkspaceListMouseUp;
+            workspaceList.ItemDrag += WorkspaceListItemDrag;
+            workspaceList.DragEnter += WorkspaceListDragEnter;
+            workspaceList.DragOver += WorkspaceListDragOver;
+            workspaceList.DragDrop += WorkspaceListDragDrop;
+            workspaceList.DragLeave += WorkspaceListDragLeave;
+            workspaceList.Resize += WorkspaceListResize;
+            workspaceList.DrawColumnHeader += WorkspaceListDrawColumnHeader;
+            workspaceList.DrawItem += WorkspaceListDrawItem;
+            workspaceList.DrawSubItem += WorkspaceListDrawSubItem;
+            listHost.Controls.Add(workspaceList);
 
             var footer = new FlowLayoutPanel();
             footer.Dock = DockStyle.Bottom;
@@ -470,11 +577,11 @@ namespace JzeroCompilerNativeLite
 
             var fileButton = CreateButton("New File", 92, Color.FromArgb(34, 34, 34));
             fileButton.Margin = new Padding(4, 0, 4, 0);
-            fileButton.Click += delegate { CreateItem(false, workspacePath); };
+            fileButton.Click += delegate { CreateItem(false, string.IsNullOrWhiteSpace(currentWorkspaceDirectory) ? workspacePath : currentWorkspaceDirectory); };
 
             var folderButton = CreateButton("New Folder", 100, Color.FromArgb(34, 34, 34));
             folderButton.Margin = new Padding(4, 0, 4, 0);
-            folderButton.Click += delegate { CreateItem(true, workspacePath); };
+            folderButton.Click += delegate { CreateItem(true, string.IsNullOrWhiteSpace(currentWorkspaceDirectory) ? workspacePath : currentWorkspaceDirectory); };
 
             var refreshButton = CreateButton("Refresh", 88, Color.FromArgb(34, 34, 34));
             refreshButton.Margin = new Padding(4, 0, 4, 0);
@@ -489,16 +596,20 @@ namespace JzeroCompilerNativeLite
                 footer.Left = Math.Max(0, (panel.ClientSize.Width - footer.PreferredSize.Width) / 2);
             };
 
-            var spacer3 = CreateSpacer(12);
+            var spacer4 = CreateSpacer(10);
+            var spacer3 = CreateSpacer(10);
             var spacer2 = CreateSpacer(8);
             var spacer1 = CreateSpacer(8);
             var spacer0 = CreateSpacer(6);
 
-            panel.Controls.Add(treeHost);
+            panel.Controls.Add(listHost);
             panel.Controls.Add(footer);
+            panel.Controls.Add(spacer4);
+            panel.Controls.Add(workspaceHintLabel);
             panel.Controls.Add(spacer3);
-            panel.Controls.Add(searchBox);
+            panel.Controls.Add(navPanel);
             panel.Controls.Add(spacer2);
+            panel.Controls.Add(searchBox);
             panel.Controls.Add(searchLabel);
             panel.Controls.Add(spacer0);
             panel.Controls.Add(workspaceLabel);
@@ -528,6 +639,7 @@ namespace JzeroCompilerNativeLite
             editorTabs.DrawItem += EditorTabsDrawItem;
             editorTabs.SelectedIndexChanged += EditorTabsSelectedIndexChanged;
             editorTabs.MouseDown += EditorTabsMouseDown;
+            editorTabs.Resize += EditorTabsResize;
 
             emptyEditorPanel = new Panel();
             emptyEditorPanel.Dock = DockStyle.Fill;
@@ -686,6 +798,9 @@ namespace JzeroCompilerNativeLite
                 if (dialog.ShowDialog(this) == DialogResult.OK)
                 {
                     workspacePath = dialog.SelectedPath;
+                    currentWorkspaceDirectory = workspacePath;
+                    workspaceHistory.Clear();
+                    workspaceHistoryIndex = -1;
                     workspaceLabel.Text = workspacePath;
                     EnsureWorkspaceExists();
                     SaveConfig();
@@ -757,50 +872,290 @@ namespace JzeroCompilerNativeLite
 
         private void MainFormKeyDown(object sender, KeyEventArgs e)
         {
-            if (e.Control && e.KeyCode == Keys.B)
+            if (e.Control && e.KeyCode == Keys.S)
+            {
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+                SaveActiveDocument();
+            }
+            else if (e.Control && e.KeyCode == Keys.B)
             {
                 e.SuppressKeyPress = true;
                 ToggleWorkspaceVisibility();
             }
+            else if (e.Control && e.KeyCode == Keys.R)
+            {
+                e.SuppressKeyPress = true;
+                ReloadActiveDocument();
+            }
+        }
+
+        private void MainFormResize(object sender, EventArgs e)
+        {
+            RefreshEditorChrome();
         }
 
         private void SearchBoxTextChanged(object sender, EventArgs e)
         {
-            LoadTree(searchBox.Text.Trim());
+            LoadTree(searchBox.Text.Trim(), GetSelectedWorkspacePath());
         }
 
-        private void FileTreeNodeMouseDoubleClick(object sender, TreeNodeMouseClickEventArgs e)
+        private void WorkspaceBackButtonClick(object sender, EventArgs e)
         {
-            var entry = e.Node.Tag as FileEntry;
-            if (entry != null && !entry.IsDirectory)
+            if (workspaceHistoryIndex > 0)
             {
-                OpenFile(entry.FullPath);
+                workspaceHistoryIndex--;
+                suppressWorkspaceHistoryPush = true;
+                try
+                {
+                    currentWorkspaceDirectory = workspaceHistory[workspaceHistoryIndex];
+                    LoadTree(searchBox.Text.Trim());
+                }
+                finally
+                {
+                    suppressWorkspaceHistoryPush = false;
+                }
             }
         }
 
-        private void FileTreeNodeMouseClick(object sender, TreeNodeMouseClickEventArgs e)
+        private void WorkspaceUpButtonClick(object sender, EventArgs e)
         {
-            if (e.Button != MouseButtons.Right)
+            if (string.IsNullOrWhiteSpace(currentWorkspaceDirectory))
             {
                 return;
             }
 
-            fileTree.SelectedNode = e.Node;
-            var entry = e.Node.Tag as FileEntry;
+            var parent = Directory.GetParent(currentWorkspaceDirectory);
+            if (parent == null || !IsPathUnderRoot(parent.FullName, workspacePath))
+            {
+                return;
+            }
+
+            NavigateWorkspace(parent.FullName);
+        }
+
+        private void WorkspaceRootButtonClick(object sender, EventArgs e)
+        {
+            NavigateWorkspace(workspacePath);
+        }
+
+        private void WorkspaceListItemActivate(object sender, EventArgs e)
+        {
+            if (workspaceList == null || workspaceList.SelectedItems.Count == 0)
+            {
+                return;
+            }
+
+            var entry = workspaceList.SelectedItems[0].Tag as FileEntry;
             if (entry == null)
             {
                 return;
             }
 
-            var targetDirectory = entry.IsDirectory ? entry.FullPath : Path.GetDirectoryName(entry.FullPath);
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("Open", null, delegate { if (!entry.IsDirectory) OpenFile(entry.FullPath); });
-            menu.Items.Add("Reveal in Explorer", null, delegate { RevealInExplorer(entry.FullPath, entry.IsDirectory); });
-            menu.Items.Add("New File", null, delegate { CreateItem(false, targetDirectory); });
-            menu.Items.Add("New Folder", null, delegate { CreateItem(true, targetDirectory); });
-            menu.Items.Add("Rename", null, delegate { RenameItem(entry.FullPath); });
-            menu.Items.Add("Delete", null, delegate { DeleteItem(entry.FullPath); });
-            menu.Show(fileTree, e.Location);
+            if (entry.IsParentLink)
+            {
+                NavigateWorkspace(entry.FullPath);
+            }
+            else if (entry.IsDirectory)
+            {
+                NavigateWorkspace(entry.FullPath);
+            }
+            else
+            {
+                OpenFile(entry.FullPath);
+            }
+        }
+
+        private void WorkspaceListMouseUp(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Right || workspaceList == null)
+            {
+                return;
+            }
+
+            var item = workspaceList.GetItemAt(e.X, e.Y);
+            if (item != null)
+            {
+                item.Selected = true;
+            }
+
+            var entry = item == null ? null : item.Tag as FileEntry;
+            ShowWorkspaceContextMenu(entry, e.Location);
+        }
+
+        private void WorkspaceListResize(object sender, EventArgs e)
+        {
+            if (workspaceList == null || workspaceList.Columns.Count < 1)
+            {
+                return;
+            }
+
+            var width = Math.Max(180, workspaceList.ClientSize.Width - 4);
+            workspaceList.Columns[0].Width = width;
+        }
+
+        private void WorkspaceListDrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
+        {
+            using (var brush = new SolidBrush(GetCurrentTheme().EditorBack))
+            {
+                e.Graphics.FillRectangle(brush, e.Bounds);
+            }
+        }
+
+        private void WorkspaceListDrawItem(object sender, DrawListViewItemEventArgs e)
+        {
+            var entry = e.Item.Tag as FileEntry;
+            var theme = GetCurrentTheme();
+            var selected = e.Item.Selected;
+            var highlightedDrop = entry != null &&
+                !string.IsNullOrWhiteSpace(workspaceDropHighlightPath) &&
+                string.Equals(entry.FullPath, workspaceDropHighlightPath, StringComparison.OrdinalIgnoreCase);
+            var bounds = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 2, Math.Max(0, e.Bounds.Width - 8), Math.Max(0, e.Bounds.Height - 4));
+            var backColor = highlightedDrop ? theme.TabActive : selected ? theme.Selection : theme.EditorBack;
+            var accentColor = entry != null && (entry.IsDirectory || entry.IsParentLink) ? theme.Accent : theme.Grid;
+
+            using (var backBrush = new SolidBrush(backColor))
+            using (var accentBrush = new SolidBrush(accentColor))
+            using (var borderPen = new Pen(highlightedDrop || selected ? theme.Accent : theme.Grid))
+            {
+                e.Graphics.FillRectangle(backBrush, bounds);
+                e.Graphics.FillRectangle(accentBrush, new Rectangle(bounds.X, bounds.Y, 4, bounds.Height));
+                e.Graphics.DrawRectangle(borderPen, bounds);
+            }
+
+            var title = entry == null
+                ? e.Item.Text
+                : entry.IsParentLink
+                    ? "..  Go Up"
+                    : (entry.IsDirectory ? Path.GetFileName(entry.FullPath) + Path.DirectorySeparatorChar : Path.GetFileName(entry.FullPath));
+            using (var titleFont = new Font(Font, FontStyle.Bold))
+            {
+                TextRenderer.DrawText(e.Graphics, title, titleFont, new Rectangle(bounds.X + 14, bounds.Y + 6, Math.Max(0, bounds.Width - 22), 20), theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            }
+        }
+
+        private void WorkspaceListDrawSubItem(object sender, DrawListViewSubItemEventArgs e)
+        {
+        }
+
+        private void WorkspaceListItemDrag(object sender, ItemDragEventArgs e)
+        {
+            if (searchBox != null && !string.IsNullOrWhiteSpace(searchBox.Text))
+            {
+                return;
+            }
+
+            var item = e.Item as ListViewItem;
+            var entry = item == null ? null : item.Tag as FileEntry;
+            if (entry == null || entry.IsParentLink || string.IsNullOrWhiteSpace(entry.FullPath))
+            {
+                return;
+            }
+
+            workspaceList.DoDragDrop(entry.FullPath, DragDropEffects.Move);
+        }
+
+        private void WorkspaceListDragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = e.Data.GetDataPresent(DataFormats.Text) ? DragDropEffects.Move : DragDropEffects.None;
+        }
+
+        private void WorkspaceListDragOver(object sender, DragEventArgs e)
+        {
+            if (!e.Data.GetDataPresent(DataFormats.Text))
+            {
+                e.Effect = DragDropEffects.None;
+                UpdateWorkspaceDropHighlight(null);
+                return;
+            }
+
+            string ignored;
+            string highlightPath;
+            e.Effect = ResolveWorkspaceDropTarget(e.X, e.Y, out ignored, out highlightPath) == null ? DragDropEffects.None : DragDropEffects.Move;
+            UpdateWorkspaceDropHighlight(highlightPath);
+        }
+
+        private void WorkspaceListDragDrop(object sender, DragEventArgs e)
+        {
+            if (!e.Data.GetDataPresent(DataFormats.Text))
+            {
+                UpdateWorkspaceDropHighlight(null);
+                return;
+            }
+
+            var sourcePath = e.Data.GetData(DataFormats.Text) as string;
+            if (string.IsNullOrWhiteSpace(sourcePath))
+            {
+                UpdateWorkspaceDropHighlight(null);
+                return;
+            }
+
+            string targetName;
+            string highlightPath;
+            var targetDirectory = ResolveWorkspaceDropTarget(e.X, e.Y, out targetName, out highlightPath);
+            UpdateWorkspaceDropHighlight(null);
+            if (string.IsNullOrWhiteSpace(targetDirectory))
+            {
+                return;
+            }
+
+            MoveWorkspaceEntry(sourcePath, targetDirectory, targetName);
+        }
+
+        private void WorkspaceListDragLeave(object sender, EventArgs e)
+        {
+            UpdateWorkspaceDropHighlight(null);
+        }
+
+        private void WorkspaceNavDragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = e.Data.GetDataPresent(DataFormats.Text) ? DragDropEffects.Move : DragDropEffects.None;
+            UpdateWorkspaceDropHighlight(null);
+            UpdateWorkspaceNavDropHighlight(sender as Control);
+        }
+
+        private void WorkspaceNavDragLeave(object sender, EventArgs e)
+        {
+            ClearWorkspaceNavDropHighlight();
+        }
+
+        private void WorkspaceUpButtonDragDrop(object sender, DragEventArgs e)
+        {
+            var sourcePath = e.Data.GetData(DataFormats.Text) as string;
+            UpdateWorkspaceDropHighlight(null);
+            ClearWorkspaceNavDropHighlight();
+            if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(currentWorkspaceDirectory))
+            {
+                return;
+            }
+
+            var parent = Directory.GetParent(currentWorkspaceDirectory);
+            if (parent != null && IsPathUnderRoot(parent.FullName, workspacePath))
+            {
+                MoveWorkspaceEntry(sourcePath, parent.FullName, null);
+            }
+        }
+
+        private void WorkspaceRootButtonDragDrop(object sender, DragEventArgs e)
+        {
+            var sourcePath = e.Data.GetData(DataFormats.Text) as string;
+            UpdateWorkspaceDropHighlight(null);
+            ClearWorkspaceNavDropHighlight();
+            if (!string.IsNullOrWhiteSpace(sourcePath))
+            {
+                MoveWorkspaceEntry(sourcePath, workspacePath, null);
+            }
+        }
+
+        private void WorkspaceLabelDragDrop(object sender, DragEventArgs e)
+        {
+            var sourcePath = e.Data.GetData(DataFormats.Text) as string;
+            UpdateWorkspaceDropHighlight(null);
+            ClearWorkspaceNavDropHighlight();
+            if (!string.IsNullOrWhiteSpace(sourcePath) && !string.IsNullOrWhiteSpace(currentWorkspaceDirectory))
+            {
+                MoveWorkspaceEntry(sourcePath, currentWorkspaceDirectory, null);
+            }
         }
 
         private void EditorTabsDrawItem(object sender, DrawItemEventArgs e)
@@ -836,8 +1191,14 @@ namespace JzeroCompilerNativeLite
 
         private void EditorTabsSelectedIndexChanged(object sender, EventArgs e)
         {
+            var active = GetActiveDocument();
+            AutoRefreshTextDocument(active);
+            if (active != null && !string.IsNullOrWhiteSpace(active.Path))
+            {
+                LoadTree(searchBox == null ? string.Empty : searchBox.Text.Trim(), active.Path);
+            }
             UpdateWindowTitle();
-            UpdateCaretPosition(GetActiveDocument() == null ? null : GetActiveDocument().Editor);
+            UpdateCaretPosition(active == null ? null : active.Editor);
             SaveConfig();
         }
 
@@ -943,12 +1304,55 @@ namespace JzeroCompilerNativeLite
             StopRunningProcess();
         }
 
+        private bool IsExecutionActive()
+        {
+            return (currentProcess != null && !currentProcess.HasExited) || (compileProcess != null && !compileProcess.HasExited);
+        }
+
+        private void AutoRefreshTextDocument(EditorDocument document)
+        {
+            if (document == null || string.IsNullOrWhiteSpace(document.Path))
+            {
+                return;
+            }
+
+            if (!string.Equals(Path.GetExtension(document.Path), ".txt", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (!File.Exists(document.Path))
+            {
+                return;
+            }
+
+            try
+            {
+                suppressDocumentDirtyTracking = true;
+                suppressAutocompleteUpdates = true;
+                var selectionStart = document.Editor.SelectionStart;
+                document.Editor.Text = File.ReadAllText(document.Path);
+                document.Editor.SelectionStart = Math.Max(0, Math.Min(selectionStart, (document.Editor.Text ?? string.Empty).Length));
+                document.IsDirty = false;
+                document.Page.Text = document.BaseTitle;
+            }
+            catch
+            {
+            }
+            finally
+            {
+                suppressAutocompleteUpdates = false;
+                suppressDocumentDirtyTracking = false;
+            }
+        }
+
         private void OpenFile(string path)
         {
             EditorDocument existing;
             if (openDocuments.TryGetValue(path, out existing))
             {
                 editorTabs.SelectedTab = existing.Page;
+                AutoRefreshTextDocument(existing);
                 return;
             }
 
@@ -1004,6 +1408,7 @@ namespace JzeroCompilerNativeLite
             editor.KeyDown += EditorKeyDown;
             editor.TextChanged += EditorTextChanged;
             editor.SelectionChanged += EditorSelectionChanged;
+            editor.Resize += EditorResize;
 
             editorHost.Controls.Add(editor);
             page.Controls.Add(editorHost);
@@ -1027,12 +1432,18 @@ namespace JzeroCompilerNativeLite
             ApplyThemeToEditor(editor);
             UpdateEditorSurfaceState();
             UpdateWindowTitle();
+            RefreshEditorChrome();
             SaveConfig();
         }
 
         private void EditorSelectionChanged(object sender, EventArgs e)
         {
-            UpdateCaretPosition(sender as FastColoredTextBox);
+            var editor = sender as FastColoredTextBox;
+            UpdateCaretPosition(editor);
+            if (!suppressAutocompleteUpdates)
+            {
+                UpdateAutocompleteForEditor(editor, false);
+            }
         }
 
         private Language GetEditorLanguage(string path)
@@ -1081,6 +1492,45 @@ namespace JzeroCompilerNativeLite
                     CloseDocumentTab(editorTabs.SelectedTab);
                 }
             }
+            else if (e.Control && e.KeyCode == Keys.R)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                ReloadActiveDocument();
+            }
+            else if (e.Control && e.KeyCode == Keys.Space)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                UpdateAutocompleteForEditor(editor, true);
+            }
+            else if (autocompletePopup != null && autocompletePopup.Visible)
+            {
+                if (e.KeyCode == Keys.Down)
+                {
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    MoveAutocompleteSelection(1);
+                }
+                else if (e.KeyCode == Keys.Up)
+                {
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    MoveAutocompleteSelection(-1);
+                }
+                else if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Tab)
+                {
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    CommitAutocompleteSelection();
+                }
+                else if (e.KeyCode == Keys.Escape)
+                {
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    HideAutocomplete();
+                }
+            }
             else if (e.KeyCode == Keys.F5)
             {
                 e.Handled = true;
@@ -1097,6 +1547,11 @@ namespace JzeroCompilerNativeLite
                 return;
             }
 
+            if (suppressDocumentDirtyTracking)
+            {
+                return;
+            }
+
             if (!document.IsDirty)
             {
                 document.IsDirty = true;
@@ -1106,6 +1561,10 @@ namespace JzeroCompilerNativeLite
 
             autoSaveTimer.Stop();
             autoSaveTimer.Start();
+            if (!suppressAutocompleteUpdates)
+            {
+                UpdateAutocompleteForEditor(sender as FastColoredTextBox, false);
+            }
         }
 
         private EditorDocument GetActiveDocument()
@@ -1147,11 +1606,17 @@ namespace JzeroCompilerNativeLite
                 openDocuments.Remove(document.Path);
             }
 
+            if (autocompleteEditor != null && document != null && ReferenceEquals(autocompleteEditor, document.Editor))
+            {
+                HideAutocomplete();
+            }
+
             editorTabs.TabPages.Remove(page);
             page.Dispose();
 
             UpdateEditorSurfaceState();
             UpdateWindowTitle();
+            RefreshEditorChrome();
             SaveConfig();
         }
 
@@ -1252,21 +1717,63 @@ namespace JzeroCompilerNativeLite
 
         private void CompileAndRun()
         {
-            if (currentProcess != null && !currentProcess.HasExited)
+            if (IsExecutionActive())
             {
-                AppendOutput("[A process is already running. Stop it first.]" + Environment.NewLine);
+                restartExecutionRequested = true;
+                StopRunningProcess();
                 return;
             }
 
+            var request = BuildCompileRequest();
+            if (request == null)
+            {
+                return;
+            }
+
+            var gccPath = @"C:\MinGW\bin\gcc.exe";
+            if (!File.Exists(gccPath))
+            {
+                AppendOutput("[gcc.exe not found at C:\\MinGW\\bin\\gcc.exe]" + Environment.NewLine);
+                RestoreOriginalFileIfNeeded(request.Document, request.TempSourcePath, request.OriginalText);
+                return;
+            }
+
+            try
+            {
+                if (File.Exists(request.ExePath))
+                {
+                    File.Delete(request.ExePath);
+                }
+            }
+            catch
+            {
+            }
+
+            if (autoClearTerminal)
+            {
+                terminalBox.Clear();
+                terminalInputStart = 0;
+            }
+
+            restartExecutionRequested = false;
+            stopRequested = false;
+            activeCompileRequest = request;
+            SetStatus("COMPILING");
+            AppendOutput("Compiling " + Path.GetFileName(request.SourcePath) + Environment.NewLine);
+            StartCompileProcess(gccPath, request);
+        }
+
+        private CompileRequest BuildCompileRequest()
+        {
             var document = GetActiveDocument();
             if (document == null)
             {
-                return;
+                return null;
             }
 
-            string sourcePath = document.Path;
+            var sourcePath = document.Path;
+            var originalText = document.Editor.Text;
             string tempSourcePath = null;
-            string originalText = document.Editor.Text;
             string exePath;
 
             if (string.IsNullOrWhiteSpace(sourcePath) || !sourcePath.EndsWith(".c", StringComparison.OrdinalIgnoreCase))
@@ -1283,73 +1790,36 @@ namespace JzeroCompilerNativeLite
                 File.WriteAllText(sourcePath, InjectBufferedOutputFix(originalText));
             }
 
-            var gccPath = @"C:\MinGW\bin\gcc.exe";
-            if (!File.Exists(gccPath))
+            return new CompileRequest
             {
-                AppendOutput("[gcc.exe not found at C:\\MinGW\\bin\\gcc.exe]" + Environment.NewLine);
-                return;
-            }
+                Document = document,
+                SourcePath = sourcePath,
+                TempSourcePath = tempSourcePath,
+                OriginalText = originalText,
+                ExePath = exePath,
+                WorkingDirectory = Path.GetDirectoryName(sourcePath)
+            };
+        }
 
-            try
+        private void StartCompileProcess(string gccPath, CompileRequest request)
+        {
+            compileProcess = new Process();
+            compileProcess.StartInfo = new ProcessStartInfo
             {
-                if (File.Exists(exePath))
-                {
-                    File.Delete(exePath);
-                }
-            }
-            catch
-            {
-            }
-
-            if (autoClearTerminal)
-            {
-                terminalBox.Clear();
-                terminalInputStart = 0;
-            }
-            SetStatus("COMPILING");
-            AppendOutput("Compiling " + Path.GetFileName(sourcePath) + Environment.NewLine);
-
-            var compileInfo = new ProcessStartInfo();
-            compileInfo.FileName = gccPath;
-            compileInfo.Arguments = "\"" + sourcePath + "\" -o \"" + exePath + "\"";
-            compileInfo.UseShellExecute = false;
-            compileInfo.RedirectStandardError = true;
-            compileInfo.RedirectStandardOutput = true;
-            compileInfo.CreateNoWindow = true;
-            compileInfo.WorkingDirectory = Path.GetDirectoryName(sourcePath);
-
-            using (var compileProcess = new Process())
-            {
-                compileProcess.StartInfo = compileInfo;
-                compileProcess.Start();
-                var stdout = compileProcess.StandardOutput.ReadToEnd();
-                var stderr = compileProcess.StandardError.ReadToEnd();
-                compileProcess.WaitForExit();
-
-                if (!string.IsNullOrWhiteSpace(stdout))
-                {
-                    AppendOutput(stdout);
-                }
-
-                if (compileProcess.ExitCode != 0 || !File.Exists(exePath))
-                {
-                    AppendOutput(string.IsNullOrWhiteSpace(stderr) ? "[Compilation failed]" + Environment.NewLine : stderr);
-                    JumpToFirstCompilerError(stderr, sourcePath);
-                    RestoreOriginalFileIfNeeded(document, tempSourcePath, originalText);
-                    SetStatus("COMPILE FAILED");
-                    return;
-                }
-
-                if (!string.IsNullOrWhiteSpace(stderr))
-                {
-                    AppendOutput(stderr);
-                }
-            }
-
-            RestoreOriginalFileIfNeeded(document, tempSourcePath, originalText);
-            SetStatus("RUNNING");
-            AppendOutput("Running..." + Environment.NewLine + "------------------------" + Environment.NewLine);
-            StartExecutable(exePath, Path.GetDirectoryName(exePath));
+                FileName = gccPath,
+                Arguments = "\"" + request.SourcePath + "\" -o \"" + request.ExePath + "\"",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = request.WorkingDirectory
+            };
+            compileProcess.EnableRaisingEvents = true;
+            compileProcess.Exited += CompileProcessExited;
+            compileProcess.Start();
+            StartStreamPump(compileProcess.StandardOutput, false);
+            StartStreamPump(compileProcess.StandardError, true);
+            UpdateStopButtonState();
         }
 
         private void StartExecutable(string exePath, string workingDirectory)
@@ -1372,6 +1842,67 @@ namespace JzeroCompilerNativeLite
             MoveTerminalCaretToEnd();
             StartStreamPump(currentProcess.StandardOutput, false);
             StartStreamPump(currentProcess.StandardError, true);
+            UpdateStopButtonState();
+        }
+
+        private void CompileProcessExited(object sender, EventArgs e)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action<object, EventArgs>(CompileProcessExited), sender, e);
+                return;
+            }
+
+            var request = activeCompileRequest;
+            var exitedProcess = compileProcess;
+            var exitCode = exitedProcess == null ? -1 : exitedProcess.ExitCode;
+
+            if (request != null)
+            {
+                RestoreOriginalFileIfNeeded(request.Document, request.TempSourcePath, request.OriginalText);
+            }
+
+            if (exitedProcess != null)
+            {
+                exitedProcess.Dispose();
+            }
+
+            compileProcess = null;
+            activeCompileRequest = null;
+            UpdateStopButtonState();
+
+            if (restartExecutionRequested)
+            {
+                restartExecutionRequested = false;
+                stopRequested = false;
+                CompileAndRun();
+                return;
+            }
+
+            if (stopRequested)
+            {
+                stopRequested = false;
+                AppendOutput(Environment.NewLine + "[Compilation stopped]" + Environment.NewLine);
+                SetStatus("READY");
+                return;
+            }
+
+            if (request == null)
+            {
+                SetStatus("COMPILE FAILED");
+                return;
+            }
+
+            if (exitCode != 0 || !File.Exists(request.ExePath))
+            {
+                JumpToFirstCompilerError(terminalBox.Text, request.SourcePath);
+                SetStatus("COMPILE FAILED");
+                return;
+            }
+
+            SetStatus("RUNNING");
+            AppendOutput("Running..." + Environment.NewLine + "------------------------" + Environment.NewLine);
+            StartExecutable(request.ExePath, Path.GetDirectoryName(request.ExePath));
         }
 
         private void ProcessExited(object sender, EventArgs e)
@@ -1386,13 +1917,38 @@ namespace JzeroCompilerNativeLite
             AppendOutput(Environment.NewLine + "[Process exited with code " + code + "]" + Environment.NewLine);
             currentProcess.Dispose();
             currentProcess = null;
+            UpdateStopButtonState();
+
+            if (restartExecutionRequested)
+            {
+                restartExecutionRequested = false;
+                stopRequested = false;
+                CompileAndRun();
+                return;
+            }
+
             SetStatus("READY");
         }
 
         private void StopRunningProcess()
         {
+            stopRequested = true;
+
+            if (compileProcess != null && !compileProcess.HasExited)
+            {
+                try
+                {
+                    compileProcess.Kill();
+                }
+                catch
+                {
+                }
+                return;
+            }
+
             if (currentProcess == null || currentProcess.HasExited)
             {
+                stopRequested = false;
                 return;
             }
 
@@ -1445,166 +2001,65 @@ namespace JzeroCompilerNativeLite
 
         private void LoadTree(string query, string focusPath)
         {
-            var expandedPaths = GetExpandedDirectoryPaths();
-            fileTree.BeginUpdate();
-            fileTree.Nodes.Clear();
-
-            var root = BuildNode(workspacePath, query);
-            if (root != null)
+            if (workspaceList == null)
             {
-                root.Text = Path.GetFileName(workspacePath);
-                fileTree.Nodes.Add(root);
-                RestoreExpandedState(root, expandedPaths, query);
-                SelectTreeNodeByPath(root, focusPath);
+                return;
             }
 
-            fileTree.EndUpdate();
-        }
+            EnsureWorkspaceExists();
 
-        private HashSet<string> GetExpandedDirectoryPaths()
-        {
-            var expandedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (TreeNode node in fileTree.Nodes)
+            if (!string.IsNullOrWhiteSpace(focusPath))
             {
-                CollectExpandedDirectoryPaths(node, expandedPaths);
-            }
-            return expandedPaths;
-        }
-
-        private void CollectExpandedDirectoryPaths(TreeNode node, HashSet<string> expandedPaths)
-        {
-            var entry = node.Tag as FileEntry;
-            if (entry != null && entry.IsDirectory && node.IsExpanded)
-            {
-                expandedPaths.Add(entry.FullPath);
-            }
-
-            foreach (TreeNode child in node.Nodes)
-            {
-                CollectExpandedDirectoryPaths(child, expandedPaths);
-            }
-        }
-
-        private void RestoreExpandedState(TreeNode node, HashSet<string> expandedPaths, string query)
-        {
-            var entry = node.Tag as FileEntry;
-            if (entry != null && entry.IsDirectory)
-            {
-                if (string.IsNullOrWhiteSpace(query))
+                var focusDirectory = Directory.Exists(focusPath) ? focusPath : Path.GetDirectoryName(focusPath);
+                if (!string.IsNullOrWhiteSpace(focusDirectory) && IsPathUnderRoot(focusDirectory, workspacePath))
                 {
-                    if (expandedPaths.Contains(entry.FullPath))
+                    currentWorkspaceDirectory = focusDirectory;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(currentWorkspaceDirectory) || !Directory.Exists(currentWorkspaceDirectory) || !IsPathUnderRoot(currentWorkspaceDirectory, workspacePath))
+            {
+                currentWorkspaceDirectory = workspacePath;
+            }
+
+            if (!suppressWorkspaceHistoryPush && string.IsNullOrWhiteSpace(query))
+            {
+                PushWorkspaceHistory(currentWorkspaceDirectory);
+            }
+
+            workspaceList.BeginUpdate();
+            workspaceList.Items.Clear();
+
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                var parent = Directory.GetParent(currentWorkspaceDirectory);
+                if (parent != null && IsPathUnderRoot(parent.FullName, workspacePath))
+                {
+                    workspaceList.Items.Add(CreateWorkspaceItem(new FileEntry
                     {
-                        node.Expand();
-                    }
+                        FullPath = parent.FullName,
+                        IsDirectory = true,
+                        IsParentLink = true
+                    }, currentWorkspaceDirectory));
                 }
-                else
+
+                foreach (var entry in GetWorkspaceEntriesForDirectory(currentWorkspaceDirectory))
                 {
-                    node.Expand();
+                    workspaceList.Items.Add(CreateWorkspaceItem(entry, currentWorkspaceDirectory));
                 }
             }
-
-            foreach (TreeNode child in node.Nodes)
+            else
             {
-                RestoreExpandedState(child, expandedPaths, query);
-            }
-        }
-
-        private bool SelectTreeNodeByPath(TreeNode node, string focusPath)
-        {
-            if (string.IsNullOrWhiteSpace(focusPath))
-            {
-                return false;
-            }
-
-            var entry = node.Tag as FileEntry;
-            if (entry != null && string.Equals(entry.FullPath, focusPath, StringComparison.OrdinalIgnoreCase))
-            {
-                fileTree.SelectedNode = node;
-                node.EnsureVisible();
-                return true;
-            }
-
-            foreach (TreeNode child in node.Nodes)
-            {
-                if (SelectTreeNodeByPath(child, focusPath))
+                foreach (var entry in SearchWorkspaceEntries(query))
                 {
-                    node.Expand();
-                    return true;
+                    workspaceList.Items.Add(CreateWorkspaceItem(entry, workspacePath));
                 }
             }
 
-            return false;
-        }
-
-        private TreeNode BuildNode(string path, string query)
-        {
-            bool isDirectory = Directory.Exists(path);
-            if (!isDirectory && !File.Exists(path))
-            {
-                return null;
-            }
-
-            if (!string.IsNullOrWhiteSpace(query) && !MatchesSearch(path, query, isDirectory))
-            {
-                if (!isDirectory)
-                {
-                    return null;
-                }
-            }
-
-            var entry = new FileEntry();
-            entry.FullPath = path;
-            entry.IsDirectory = isDirectory;
-
-            var node = new TreeNode(Path.GetFileName(path));
-            node.Tag = entry;
-
-            if (isDirectory)
-            {
-                IEnumerable<string> directories = Enumerable.Empty<string>();
-                IEnumerable<string> files = Enumerable.Empty<string>();
-
-                try
-                {
-                    directories = Directory.GetDirectories(path)
-                        .Where(item => !string.Equals(Path.GetFileName(item), "node_modules", StringComparison.OrdinalIgnoreCase))
-                        .Where(item => !string.Equals(Path.GetFileName(item), ".git", StringComparison.OrdinalIgnoreCase))
-                        .OrderBy(item => item);
-
-                    files = Directory.GetFiles(path)
-                        .Where(item => allowedExtensions.Contains(Path.GetExtension(item).ToLowerInvariant()))
-                        .OrderBy(item => FilePriority(item))
-                        .ThenBy(item => item);
-                }
-                catch
-                {
-                }
-
-                foreach (var directory in directories)
-                {
-                    var child = BuildNode(directory, query);
-                    if (child != null)
-                    {
-                        node.Nodes.Add(child);
-                    }
-                }
-
-                foreach (var file in files)
-                {
-                    var child = BuildNode(file, query);
-                    if (child != null)
-                    {
-                        node.Nodes.Add(child);
-                    }
-                }
-
-                if (!string.IsNullOrWhiteSpace(query) && node.Nodes.Count == 0 && !MatchesSearch(path, query, true))
-                {
-                    return null;
-                }
-            }
-
-            return node;
+            workspaceList.EndUpdate();
+            SelectWorkspaceItemByPath(focusPath);
+            UpdateWorkspaceHeader(query);
+            UpdateWorkspaceNavigationState();
         }
 
         private bool MatchesSearch(string path, string query, bool isDirectory)
@@ -1632,6 +2087,129 @@ namespace JzeroCompilerNativeLite
             catch
             {
                 return false;
+            }
+        }
+
+        private IEnumerable<FileEntry> GetWorkspaceEntriesForDirectory(string directory)
+        {
+            IEnumerable<string> directories = Enumerable.Empty<string>();
+            IEnumerable<string> files = Enumerable.Empty<string>();
+
+            try
+            {
+                directories = Directory.GetDirectories(directory)
+                    .Where(item => !string.Equals(Path.GetFileName(item), "node_modules", StringComparison.OrdinalIgnoreCase))
+                    .Where(item => !string.Equals(Path.GetFileName(item), ".git", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(item => item);
+
+                files = Directory.GetFiles(directory)
+                    .Where(item => allowedExtensions.Contains(Path.GetExtension(item).ToLowerInvariant()))
+                    .OrderBy(item => FilePriority(item))
+                    .ThenBy(item => item);
+            }
+            catch
+            {
+            }
+
+            foreach (var item in directories)
+            {
+                yield return new FileEntry { FullPath = item, IsDirectory = true };
+            }
+
+            foreach (var item in files)
+            {
+                yield return new FileEntry { FullPath = item, IsDirectory = false };
+            }
+        }
+
+        private IEnumerable<FileEntry> SearchWorkspaceEntries(string query)
+        {
+            var results = new List<FileEntry>();
+            var pending = new Stack<string>();
+            pending.Push(workspacePath);
+
+            while (pending.Count > 0)
+            {
+                var current = pending.Pop();
+                IEnumerable<string> directories = Enumerable.Empty<string>();
+                IEnumerable<string> files = Enumerable.Empty<string>();
+
+                try
+                {
+                    directories = Directory.GetDirectories(current)
+                        .Where(item => !string.Equals(Path.GetFileName(item), "node_modules", StringComparison.OrdinalIgnoreCase))
+                        .Where(item => !string.Equals(Path.GetFileName(item), ".git", StringComparison.OrdinalIgnoreCase));
+                    files = Directory.GetFiles(current)
+                        .Where(item => allowedExtensions.Contains(Path.GetExtension(item).ToLowerInvariant()));
+                }
+                catch
+                {
+                }
+
+                foreach (var directory in directories.OrderBy(item => item))
+                {
+                    pending.Push(directory);
+                    if (MatchesSearch(directory, query, true))
+                    {
+                        results.Add(new FileEntry { FullPath = directory, IsDirectory = true });
+                    }
+                }
+
+                foreach (var file in files.OrderBy(item => FilePriority(item)).ThenBy(item => item))
+                {
+                    if (MatchesSearch(file, query, false))
+                    {
+                        results.Add(new FileEntry { FullPath = file, IsDirectory = false });
+                    }
+                }
+            }
+
+            return results;
+        }
+
+        private ListViewItem CreateWorkspaceItem(FileEntry entry, string relativeBasePath)
+        {
+            var item = new ListViewItem(entry.IsDirectory ? Path.GetFileName(entry.FullPath) + Path.DirectorySeparatorChar : Path.GetFileName(entry.FullPath));
+            item.Tag = entry;
+            return item;
+        }
+
+        private void SelectWorkspaceItemByPath(string focusPath)
+        {
+            if (workspaceList == null || string.IsNullOrWhiteSpace(focusPath))
+            {
+                return;
+            }
+
+            foreach (ListViewItem item in workspaceList.Items)
+            {
+                var entry = item.Tag as FileEntry;
+                if (entry != null && string.Equals(entry.FullPath, focusPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    item.Selected = true;
+                    item.Focused = true;
+                    item.EnsureVisible();
+                    return;
+                }
+            }
+        }
+
+        private void UpdateWorkspaceHeader(string query)
+        {
+            if (workspaceLabel != null)
+            {
+                var relative = MakeRelativePath(workspacePath, currentWorkspaceDirectory);
+                var locationText = string.Equals(relative, ".", StringComparison.OrdinalIgnoreCase)
+                    ? workspacePath
+                    : workspacePath + "  >  " + relative.Replace(Path.DirectorySeparatorChar.ToString(), " > ");
+                workspaceLabel.Text = string.IsNullOrWhiteSpace(query) ? locationText : "Search in " + workspacePath;
+            }
+
+            if (workspaceHintLabel != null)
+            {
+                workspaceHintLabel.Text = string.IsNullOrWhiteSpace(query)
+                    ? "Double-click folders to enter. Drag entries onto folders to move them."
+                    : "Search is showing workspace-wide matches. Clear search to drag or navigate normally.";
             }
         }
 
@@ -1663,6 +2241,7 @@ namespace JzeroCompilerNativeLite
                 if (isFolder)
                 {
                     Directory.CreateDirectory(targetPath);
+                    NavigateWorkspace(targetPath);
                 }
                 else
                 {
@@ -1680,6 +2259,7 @@ namespace JzeroCompilerNativeLite
 
         private void RenameItem(string path)
         {
+            var isDirectory = Directory.Exists(path);
             var currentName = Path.GetFileName(path);
             var newName = PromptDialog.Show(this, "Rename", "Enter new name:", currentName);
             if (string.IsNullOrWhiteSpace(newName) || string.Equals(newName, currentName, StringComparison.OrdinalIgnoreCase))
@@ -1690,7 +2270,7 @@ namespace JzeroCompilerNativeLite
             var newPath = Path.Combine(Path.GetDirectoryName(path), newName);
             try
             {
-                if (Directory.Exists(path))
+                if (isDirectory)
                 {
                     Directory.Move(path, newPath);
                 }
@@ -1699,18 +2279,10 @@ namespace JzeroCompilerNativeLite
                     File.Move(path, newPath);
                 }
 
-                EditorDocument document;
-                if (openDocuments.TryGetValue(path, out document))
-                {
-                    openDocuments.Remove(path);
-                    document.Path = newPath;
-                    document.BaseTitle = Path.GetFileName(newPath);
-                    document.Page.Text = document.IsDirty ? document.BaseTitle + " *" : document.BaseTitle;
-                    openDocuments[newPath] = document;
-                }
-
+                UpdateTrackedPathsAfterMove(path, newPath, isDirectory);
                 LoadTree(searchBox.Text.Trim(), newPath);
                 UpdateWindowTitle();
+                SaveConfig();
             }
             catch (Exception ex)
             {
@@ -1740,19 +2312,421 @@ namespace JzeroCompilerNativeLite
                     File.Delete(path);
                 }
 
-                EditorDocument document;
-                if (openDocuments.TryGetValue(path, out document))
+                RemoveTrackedPathsForDelete(path, isDirectory);
+
+                if (isDirectory && IsPathUnderRoot(currentWorkspaceDirectory, path))
                 {
-                    editorTabs.TabPages.Remove(document.Page);
-                    openDocuments.Remove(path);
+                    currentWorkspaceDirectory = Path.GetDirectoryName(path);
+                    if (string.IsNullOrWhiteSpace(currentWorkspaceDirectory) || !IsPathUnderRoot(currentWorkspaceDirectory, workspacePath))
+                    {
+                        currentWorkspaceDirectory = workspacePath;
+                    }
                 }
 
                 LoadTree(searchBox.Text.Trim());
                 UpdateWindowTitle();
+                SaveConfig();
             }
             catch (Exception ex)
             {
                 MessageBox.Show(this, ex.Message, "Delete failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ShowWorkspaceContextMenu(FileEntry entry, Point location)
+        {
+            var targetPath = entry == null ? currentWorkspaceDirectory : entry.FullPath;
+            var targetDirectory = entry == null
+                ? currentWorkspaceDirectory
+                : entry.IsDirectory ? entry.FullPath : Path.GetDirectoryName(entry.FullPath);
+            var menu = new ContextMenuStrip();
+
+            if (entry != null && !entry.IsDirectory)
+            {
+                menu.Items.Add("Open", null, delegate { OpenFile(entry.FullPath); });
+            }
+
+            if (entry != null)
+            {
+                menu.Items.Add("Reveal in Explorer", null, delegate { RevealInExplorer(entry.FullPath, entry.IsDirectory); });
+            }
+
+            menu.Items.Add("New File", null, delegate { CreateItem(false, targetDirectory); });
+            menu.Items.Add("New Folder", null, delegate { CreateItem(true, targetDirectory); });
+
+            if (entry != null)
+            {
+                menu.Items.Add("Rename", null, delegate { RenameItem(entry.FullPath); });
+                menu.Items.Add("Delete", null, delegate { DeleteItem(entry.FullPath); });
+            }
+
+            menu.Show(workspaceList, location);
+        }
+
+        private void NavigateWorkspace(string targetDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(targetDirectory) || !Directory.Exists(targetDirectory))
+            {
+                return;
+            }
+
+            if (!IsPathUnderRoot(targetDirectory, workspacePath))
+            {
+                return;
+            }
+
+            currentWorkspaceDirectory = targetDirectory;
+            LoadTree(searchBox == null ? string.Empty : searchBox.Text.Trim());
+        }
+
+        private void PushWorkspaceHistory(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return;
+            }
+
+            if (workspaceHistoryIndex >= 0 && workspaceHistoryIndex < workspaceHistory.Count &&
+                string.Equals(workspaceHistory[workspaceHistoryIndex], path, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (workspaceHistoryIndex < workspaceHistory.Count - 1)
+            {
+                workspaceHistory.RemoveRange(workspaceHistoryIndex + 1, workspaceHistory.Count - workspaceHistoryIndex - 1);
+            }
+
+            workspaceHistory.Add(path);
+            workspaceHistoryIndex = workspaceHistory.Count - 1;
+        }
+
+        private void UpdateWorkspaceNavigationState()
+        {
+            if (workspaceBackButton != null)
+            {
+                workspaceBackButton.Enabled = workspaceHistoryIndex > 0;
+            }
+
+            if (workspaceUpButton != null)
+            {
+                workspaceUpButton.Enabled = !string.IsNullOrWhiteSpace(currentWorkspaceDirectory) &&
+                    !string.Equals(Path.GetFullPath(currentWorkspaceDirectory).TrimEnd(Path.DirectorySeparatorChar), Path.GetFullPath(workspacePath).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (workspaceRootButton != null)
+            {
+                workspaceRootButton.Enabled = Directory.Exists(workspacePath);
+            }
+
+            if (workspaceRefreshButton != null)
+            {
+                workspaceRefreshButton.Enabled = true;
+            }
+        }
+
+        private void UpdateWorkspaceNavDropHighlight(Control target)
+        {
+            var nextUp = ReferenceEquals(target, workspaceUpButton);
+            var nextRoot = ReferenceEquals(target, workspaceRootButton);
+            var nextLabel = ReferenceEquals(target, workspaceLabel);
+            if (workspaceUpDropHighlighted == nextUp &&
+                workspaceRootDropHighlighted == nextRoot &&
+                workspaceLabelDropHighlighted == nextLabel)
+            {
+                return;
+            }
+
+            workspaceUpDropHighlighted = nextUp;
+            workspaceRootDropHighlighted = nextRoot;
+            workspaceLabelDropHighlighted = nextLabel;
+            ApplyWorkspaceNavDropHighlightVisuals();
+        }
+
+        private void ClearWorkspaceNavDropHighlight()
+        {
+            if (!workspaceUpDropHighlighted && !workspaceRootDropHighlighted && !workspaceLabelDropHighlighted)
+            {
+                return;
+            }
+
+            workspaceUpDropHighlighted = false;
+            workspaceRootDropHighlighted = false;
+            workspaceLabelDropHighlighted = false;
+            ApplyWorkspaceNavDropHighlightVisuals();
+        }
+
+        private void ApplyWorkspaceNavDropHighlightVisuals()
+        {
+            var theme = GetCurrentTheme();
+
+            if (workspaceUpButton != null)
+            {
+                workspaceUpButton.BackColor = workspaceUpDropHighlighted ? theme.Accent : theme.SurfaceBack;
+                workspaceUpButton.ForeColor = workspaceUpDropHighlighted ? theme.WindowBack : theme.Text;
+                workspaceUpButton.FlatAppearance.BorderColor = workspaceUpDropHighlighted ? theme.Accent : theme.Grid;
+            }
+
+            if (workspaceRootButton != null)
+            {
+                workspaceRootButton.BackColor = workspaceRootDropHighlighted ? theme.Accent : theme.SurfaceBack;
+                workspaceRootButton.ForeColor = workspaceRootDropHighlighted ? theme.WindowBack : theme.Text;
+                workspaceRootButton.FlatAppearance.BorderColor = workspaceRootDropHighlighted ? theme.Accent : theme.Grid;
+            }
+
+            if (workspaceLabel != null)
+            {
+                workspaceLabel.BackColor = workspaceLabelDropHighlighted ? theme.TabActive : theme.SurfaceBack;
+                workspaceLabel.ForeColor = theme.Text;
+            }
+        }
+
+        private void UpdateWorkspaceDropHighlight(string targetPath)
+        {
+            if (string.Equals(workspaceDropHighlightPath, targetPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            workspaceDropHighlightPath = targetPath;
+            if (workspaceList != null)
+            {
+                workspaceList.InvalidateHighlightRows();
+            }
+        }
+
+        private string GetSelectedWorkspacePath()
+        {
+            if (workspaceList == null || workspaceList.SelectedItems.Count == 0)
+            {
+                return null;
+            }
+
+            var entry = workspaceList.SelectedItems[0].Tag as FileEntry;
+            return entry == null ? null : entry.FullPath;
+        }
+
+        private string ResolveWorkspaceDropTarget(int screenX, int screenY, out string targetName, out string highlightPath)
+        {
+            targetName = null;
+            highlightPath = null;
+            if (workspaceList == null || searchBox == null || !string.IsNullOrWhiteSpace(searchBox.Text))
+            {
+                return null;
+            }
+
+            var point = workspaceList.PointToClient(new Point(screenX, screenY));
+            var targetItem = workspaceList.GetItemAt(point.X, point.Y);
+            if (targetItem == null)
+            {
+                return currentWorkspaceDirectory;
+            }
+
+            var targetEntry = targetItem.Tag as FileEntry;
+            if (targetEntry == null)
+            {
+                return null;
+            }
+
+            targetName = Path.GetFileName(targetEntry.FullPath);
+            if (targetEntry.IsParentLink)
+            {
+                highlightPath = targetEntry.FullPath;
+                return targetEntry.FullPath;
+            }
+
+            if (targetEntry.IsDirectory)
+            {
+                highlightPath = targetEntry.FullPath;
+                return targetEntry.FullPath;
+            }
+
+            return Path.GetDirectoryName(targetEntry.FullPath);
+        }
+
+        private void MoveWorkspaceEntry(string sourcePath, string targetDirectory, string targetName)
+        {
+            if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(targetDirectory))
+            {
+                return;
+            }
+
+            if (!IsPathUnderRoot(sourcePath, workspacePath) || !IsPathUnderRoot(targetDirectory, workspacePath))
+            {
+                return;
+            }
+
+            var isDirectory = Directory.Exists(sourcePath);
+            if (!isDirectory && !File.Exists(sourcePath))
+            {
+                return;
+            }
+
+            var destinationPath = Path.Combine(targetDirectory, Path.GetFileName(sourcePath));
+            if (string.Equals(sourcePath, destinationPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (isDirectory && IsPathUnderRoot(targetDirectory, sourcePath))
+            {
+                MessageBox.Show(this, "A folder cannot be moved inside itself.", "Move blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (Directory.Exists(destinationPath) || File.Exists(destinationPath))
+            {
+                MessageBox.Show(this, "An item with the same name already exists in the target folder.", "Move blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                if (isDirectory)
+                {
+                    Directory.Move(sourcePath, destinationPath);
+                }
+                else
+                {
+                    File.Move(sourcePath, destinationPath);
+                }
+
+                UpdateTrackedPathsAfterMove(sourcePath, destinationPath, isDirectory);
+                LoadTree(searchBox.Text.Trim(), destinationPath);
+                SaveConfig();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Move failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void UpdateTrackedPathsAfterMove(string oldPath, string newPath, bool isDirectory)
+        {
+            var affectedDocuments = openDocuments.Values
+                .Where(document => !string.IsNullOrWhiteSpace(document.Path) &&
+                    (isDirectory ? IsPathUnderRoot(document.Path, oldPath) : string.Equals(document.Path, oldPath, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            foreach (var document in affectedDocuments)
+            {
+                openDocuments.Remove(document.Path);
+                document.Path = ReplaceTrackedPath(document.Path, oldPath, newPath, isDirectory);
+                document.BaseTitle = Path.GetFileName(document.Path);
+                document.Page.Text = document.IsDirty ? document.BaseTitle + " *" : document.BaseTitle;
+                openDocuments[document.Path] = document;
+            }
+
+            lastOpenFiles = ReplaceTrackedPaths(lastOpenFiles, oldPath, newPath, isDirectory);
+            recentFiles = ReplaceTrackedPaths(recentFiles, oldPath, newPath, isDirectory);
+            if (!string.IsNullOrWhiteSpace(lastSelectedFilePath))
+            {
+                lastSelectedFilePath = ReplaceTrackedPath(lastSelectedFilePath, oldPath, newPath, isDirectory);
+            }
+
+            if (!string.IsNullOrWhiteSpace(currentWorkspaceDirectory))
+            {
+                currentWorkspaceDirectory = ReplaceTrackedPath(currentWorkspaceDirectory, oldPath, newPath, isDirectory);
+            }
+
+            UpdateWindowTitle();
+        }
+
+        private void RemoveTrackedPathsForDelete(string path, bool isDirectory)
+        {
+            var toClose = openDocuments.Values
+                .Where(document => !string.IsNullOrWhiteSpace(document.Path) &&
+                    (isDirectory ? IsPathUnderRoot(document.Path, path) : string.Equals(document.Path, path, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            foreach (var document in toClose)
+            {
+                openDocuments.Remove(document.Path);
+                if (autocompleteEditor != null && ReferenceEquals(autocompleteEditor, document.Editor))
+                {
+                    HideAutocomplete();
+                }
+                editorTabs.TabPages.Remove(document.Page);
+                document.Page.Dispose();
+            }
+
+            lastOpenFiles = lastOpenFiles
+                .Where(item => !(isDirectory ? IsPathUnderRoot(item, path) : string.Equals(item, path, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+            recentFiles = recentFiles
+                .Where(item => !(isDirectory ? IsPathUnderRoot(item, path) : string.Equals(item, path, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            if (!string.IsNullOrWhiteSpace(lastSelectedFilePath) &&
+                (isDirectory ? IsPathUnderRoot(lastSelectedFilePath, path) : string.Equals(lastSelectedFilePath, path, StringComparison.OrdinalIgnoreCase)))
+            {
+                lastSelectedFilePath = null;
+            }
+
+            UpdateEditorSurfaceState();
+            RefreshEditorChrome();
+        }
+
+        private List<string> ReplaceTrackedPaths(List<string> items, string oldPath, string newPath, bool isDirectory)
+        {
+            return items
+                .Select(item => ReplaceTrackedPath(item, oldPath, newPath, isDirectory))
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private string ReplaceTrackedPath(string value, string oldPath, string newPath, bool isDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+
+            if (!isDirectory)
+            {
+                return string.Equals(value, oldPath, StringComparison.OrdinalIgnoreCase) ? newPath : value;
+            }
+
+            if (!IsPathUnderRoot(value, oldPath))
+            {
+                return value;
+            }
+
+            var suffix = value.Substring(oldPath.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return string.IsNullOrWhiteSpace(suffix) ? newPath : Path.Combine(newPath, suffix);
+        }
+
+        private bool IsPathUnderRoot(string path, string rootPath)
+        {
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(rootPath))
+            {
+                return false;
+            }
+
+            try
+            {
+                var fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                var fullRoot = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                return fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string MakeRelativePath(string basePath, string path)
+        {
+            try
+            {
+                var baseUri = new Uri(Path.GetFullPath(basePath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar);
+                var targetUri = new Uri(Path.GetFullPath(path));
+                return Uri.UnescapeDataString(baseUri.MakeRelativeUri(targetUri).ToString().Replace('/', Path.DirectorySeparatorChar));
+            }
+            catch
+            {
+                return path;
             }
         }
 
@@ -1805,6 +2779,7 @@ namespace JzeroCompilerNativeLite
         private void SetStatus(string text)
         {
             statusLabel.Text = text;
+            UpdateStopButtonState();
         }
 
         private void UpdateCaretPosition(FastColoredTextBox editor)
@@ -1932,6 +2907,21 @@ namespace JzeroCompilerNativeLite
             autoClearButton.ForeColor = theme.Text;
         }
 
+        private void UpdateStopButtonState()
+        {
+            if (stopButton == null)
+            {
+                return;
+            }
+
+            var theme = GetCurrentTheme();
+            var active = IsExecutionActive();
+            stopButton.Enabled = active;
+            stopButton.BackColor = active ? theme.Danger : theme.SurfaceBack;
+            stopButton.ForeColor = active ? theme.Text : theme.MutedText;
+            stopButton.FlatAppearance.BorderColor = active ? theme.Danger : theme.Grid;
+        }
+
         private void UpdateWindowTitle()
         {
             var document = GetActiveDocument();
@@ -1951,11 +2941,92 @@ namespace JzeroCompilerNativeLite
             emptyEditorPanel.Visible = !hasOpenTabs;
         }
 
+        private void EditorTabsResize(object sender, EventArgs e)
+        {
+            RefreshEditorChrome();
+        }
+
+        private void EditorResize(object sender, EventArgs e)
+        {
+            RefreshEditorChrome();
+            if (!suppressAutocompleteUpdates)
+            {
+                UpdateAutocompleteForEditor(sender as FastColoredTextBox, false);
+            }
+        }
+
+        private void RefreshEditorChrome()
+        {
+            if (editorTabs == null)
+            {
+                return;
+            }
+
+            editorTabs.Invalidate();
+            editorTabs.Update();
+
+            foreach (TabPage page in editorTabs.TabPages)
+            {
+                var document = page.Tag as EditorDocument;
+                if (document != null && document.Editor != null)
+                {
+                    document.Editor.Invalidate();
+                    document.Editor.Update();
+                }
+            }
+        }
+
+        private void ReloadActiveDocument()
+        {
+            var document = GetActiveDocument();
+            if (document == null || string.IsNullOrWhiteSpace(document.Path))
+            {
+                return;
+            }
+
+            if (!File.Exists(document.Path))
+            {
+                MessageBox.Show(this, "The file no longer exists on disk.", "Reload failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (document.IsDirty)
+            {
+                var result = MessageBox.Show(this, "Discard unsaved changes and reload from disk?", "Reload file", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (result != DialogResult.Yes)
+                {
+                    return;
+                }
+            }
+
+            try
+            {
+                var selectionStart = document.Editor.SelectionStart;
+                suppressDocumentDirtyTracking = true;
+                document.Editor.Text = File.ReadAllText(document.Path);
+                document.Editor.SelectionStart = Math.Max(0, Math.Min(selectionStart, (document.Editor.Text ?? string.Empty).Length));
+                document.IsDirty = false;
+                document.Page.Text = document.BaseTitle;
+                document.Editor.Invalidate();
+                SetStatus("SAVED");
+                UpdateWindowTitle();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Reload failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                suppressDocumentDirtyTracking = false;
+            }
+        }
+
         private void WorkspaceSplitSplitterMoved(object sender, SplitterEventArgs e)
         {
             if (workspaceSplit != null && workspaceVisible)
             {
                 workspaceSplitterDistance = workspaceSplit.SplitterDistance;
+                RefreshEditorChrome();
                 SaveConfig();
             }
         }
@@ -1965,6 +3036,7 @@ namespace JzeroCompilerNativeLite
             if (editorTerminalSplit != null)
             {
                 terminalSplitterDistance = editorTerminalSplit.SplitterDistance;
+                RefreshEditorChrome();
             }
         }
 
@@ -2007,6 +3079,8 @@ namespace JzeroCompilerNativeLite
                 }
                 workspaceSplit.Panel1Collapsed = true;
             }
+
+            RefreshEditorChrome();
         }
 
         private void RestoreSession()
@@ -2143,7 +3217,10 @@ namespace JzeroCompilerNativeLite
             }
 
             UpdateAutoClearButton();
+            UpdateStopButtonState();
+            ApplyWorkspaceNavDropHighlightVisuals();
             editorTabs.Invalidate();
+            ApplyAutocompleteTheme(theme);
         }
 
         private void ApplyThemeRecursive(Control control, ThemePalette theme)
@@ -2151,6 +3228,7 @@ namespace JzeroCompilerNativeLite
             var panel = control as Panel;
             var label = control as Label;
             var tree = control as TreeView;
+            var list = control as ListView;
             var input = control as TextBox;
             var button = control as Button;
             var split = control as SplitContainer;
@@ -2167,6 +3245,11 @@ namespace JzeroCompilerNativeLite
                 {
                     label.BackColor = theme.SurfaceBack;
                 }
+                else if (label == workspaceHintLabel)
+                {
+                    label.BackColor = Color.Transparent;
+                    label.ForeColor = theme.MutedText;
+                }
             }
 
             if (tree != null)
@@ -2174,6 +3257,12 @@ namespace JzeroCompilerNativeLite
                 tree.BackColor = theme.EditorBack;
                 tree.ForeColor = theme.Text;
                 tree.LineColor = theme.Grid;
+            }
+
+            if (list != null)
+            {
+                list.BackColor = theme.EditorBack;
+                list.ForeColor = theme.Text;
             }
 
             if (input != null)
@@ -2190,14 +3279,14 @@ namespace JzeroCompilerNativeLite
                 }
                 else if (button == stopButton)
                 {
-                    button.BackColor = theme.Danger;
+                    button.BackColor = stopButton.Enabled ? theme.Danger : theme.SurfaceBack;
                 }
                 else if (button != autoClearButton)
                 {
                     button.BackColor = theme.SurfaceBack;
                 }
-                button.ForeColor = theme.Text;
-                button.FlatAppearance.BorderColor = theme.Grid;
+                button.ForeColor = button == stopButton && !stopButton.Enabled ? theme.MutedText : theme.Text;
+                button.FlatAppearance.BorderColor = button == stopButton && stopButton.Enabled ? theme.Danger : theme.Grid;
             }
 
             if (split != null)
@@ -2223,6 +3312,268 @@ namespace JzeroCompilerNativeLite
             editor.SelectionColor = theme.Selection;
             editor.CurrentLineColor = theme.EditorCurrentLine;
             editor.CaretColor = theme.Text;
+        }
+
+        private void InitializeAutocomplete()
+        {
+            autocompleteList = new ListBox();
+            autocompleteList.BorderStyle = BorderStyle.None;
+            autocompleteList.IntegralHeight = false;
+            autocompleteList.Font = new Font(editorFontFamily, Math.Max(9F, editorFontSize));
+            autocompleteList.Width = 260;
+            autocompleteList.Height = 180;
+            autocompleteList.Click += AutocompleteListClick;
+            autocompleteList.DoubleClick += AutocompleteListDoubleClick;
+            autocompleteList.MouseMove += AutocompleteListMouseMove;
+
+            var host = new ToolStripControlHost(autocompleteList);
+            host.Margin = Padding.Empty;
+            host.Padding = Padding.Empty;
+            host.AutoSize = false;
+            host.Size = autocompleteList.Size;
+
+            autocompletePopup = new ToolStripDropDown();
+            autocompletePopup.Padding = Padding.Empty;
+            autocompletePopup.Margin = Padding.Empty;
+            autocompletePopup.AutoClose = false;
+            autocompletePopup.Items.Add(host);
+            ApplyAutocompleteTheme(GetCurrentTheme());
+        }
+
+        private void ApplyAutocompleteTheme(ThemePalette theme)
+        {
+            if (autocompleteList == null || autocompletePopup == null)
+            {
+                return;
+            }
+
+            autocompleteList.BackColor = theme.EditorBack;
+            autocompleteList.ForeColor = theme.Text;
+            autocompletePopup.BackColor = theme.PanelBack;
+            autocompleteList.Font = new Font(editorFontFamily, Math.Max(9F, editorFontSize));
+        }
+
+        private void UpdateAutocompleteForEditor(FastColoredTextBox editor, bool forceShow)
+        {
+            if (editor == null || autocompleteList == null || autocompletePopup == null)
+            {
+                HideAutocomplete();
+                return;
+            }
+
+            if (editor.SelectionLength > 0)
+            {
+                HideAutocomplete();
+                return;
+            }
+
+            int replaceStart;
+            string prefix;
+            if (!TryGetAutocompletePrefix(editor, forceShow, out replaceStart, out prefix))
+            {
+                HideAutocomplete();
+                return;
+            }
+
+            var suggestions = BuildAutocompleteSuggestions(editor, prefix, forceShow).ToList();
+            if (suggestions.Count == 0)
+            {
+                HideAutocomplete();
+                return;
+            }
+
+            autocompleteEditor = editor;
+            autocompleteReplaceStart = replaceStart;
+            autocompleteReplaceLength = editor.SelectionStart - replaceStart;
+
+            autocompleteList.BeginUpdate();
+            autocompleteList.Items.Clear();
+            foreach (var suggestion in suggestions)
+            {
+                autocompleteList.Items.Add(suggestion);
+            }
+            autocompleteList.SelectedIndex = 0;
+            autocompleteList.EndUpdate();
+
+            var popupLocation = GetAutocompletePopupLocation(editor);
+            autocompletePopup.Show(popupLocation);
+            autocompleteList.Focus();
+            editor.Focus();
+        }
+
+        private bool TryGetAutocompletePrefix(FastColoredTextBox editor, bool forceShow, out int replaceStart, out string prefix)
+        {
+            replaceStart = editor.SelectionStart;
+            prefix = string.Empty;
+
+            var position = editor.SelectionStart;
+            if (position < 0 || position > (editor.Text ?? string.Empty).Length)
+            {
+                return false;
+            }
+
+            var text = editor.Text ?? string.Empty;
+            var start = position;
+            while (start > 0)
+            {
+                var ch = text[start - 1];
+                if (!char.IsLetterOrDigit(ch) && ch != '_' && ch != '#')
+                {
+                    break;
+                }
+                start--;
+            }
+
+            prefix = text.Substring(start, position - start);
+            replaceStart = start;
+            return forceShow || prefix.Length >= 1;
+        }
+
+        private IEnumerable<string> BuildAutocompleteSuggestions(FastColoredTextBox editor, string prefix, bool forceShow)
+        {
+            var suggestions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var keyword in cKeywords)
+            {
+                suggestions.Add(keyword);
+            }
+            foreach (var snippet in autocompleteSnippets)
+            {
+                suggestions.Add(snippet);
+            }
+
+            foreach (Match match in Regex.Matches(editor.Text ?? string.Empty, @"\b[A-Za-z_][A-Za-z0-9_]*\b"))
+            {
+                suggestions.Add(match.Value);
+            }
+
+            var filtered = suggestions
+                .Where(item => forceShow || item.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .Where(item => forceShow || !string.Equals(item, prefix, StringComparison.Ordinal))
+                .OrderBy(item => item.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(item => item.Length)
+                .ThenBy(item => item)
+                .Take(14);
+
+            return filtered;
+        }
+
+        private Point GetAutocompletePopupLocation(FastColoredTextBox editor)
+        {
+            var caretPlace = editor.PositionToPlace(editor.SelectionStart);
+            var caretPoint = editor.PlaceToPoint(caretPlace);
+            var clientPoint = new Point(caretPoint.X, caretPoint.Y + editor.CharHeight + 6);
+            return editor.PointToScreen(clientPoint);
+        }
+
+        private void MoveAutocompleteSelection(int offset)
+        {
+            if (autocompleteList == null || autocompleteList.Items.Count == 0)
+            {
+                return;
+            }
+
+            var nextIndex = autocompleteList.SelectedIndex + offset;
+            if (nextIndex < 0)
+            {
+                nextIndex = autocompleteList.Items.Count - 1;
+            }
+            else if (nextIndex >= autocompleteList.Items.Count)
+            {
+                nextIndex = 0;
+            }
+
+            autocompleteList.SelectedIndex = nextIndex;
+        }
+
+        private void CommitAutocompleteSelection()
+        {
+            if (autocompleteEditor == null || autocompleteList == null || autocompleteList.SelectedItem == null)
+            {
+                HideAutocomplete();
+                return;
+            }
+
+            var value = autocompleteList.SelectedItem.ToString();
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                HideAutocomplete();
+                return;
+            }
+
+            var editor = autocompleteEditor;
+            var replaceStart = autocompleteReplaceStart;
+            var replaceLength = autocompleteReplaceLength;
+
+            suppressAutocompleteUpdates = true;
+            try
+            {
+                HideAutocomplete();
+                if (editor == null || editor.IsDisposed)
+                {
+                    return;
+                }
+
+                replaceStart = Math.Max(0, Math.Min(replaceStart, (editor.Text ?? string.Empty).Length));
+                replaceLength = Math.Max(0, Math.Min(replaceLength, (editor.Text ?? string.Empty).Length - replaceStart));
+                var text = editor.Text ?? string.Empty;
+                var updatedText = text.Substring(0, replaceStart) + value + text.Substring(replaceStart + replaceLength);
+                editor.Text = updatedText;
+                editor.SelectionStart = replaceStart + value.Length;
+                editor.Focus();
+            }
+            catch
+            {
+                if (!suppressAutocompleteCommitErrors)
+                {
+                    suppressAutocompleteCommitErrors = true;
+                    try
+                    {
+                        HideAutocomplete();
+                    }
+                    finally
+                    {
+                        suppressAutocompleteCommitErrors = false;
+                    }
+                }
+            }
+            finally
+            {
+                suppressAutocompleteUpdates = false;
+            }
+        }
+
+        private void HideAutocomplete()
+        {
+            if (autocompletePopup != null && autocompletePopup.Visible)
+            {
+                autocompletePopup.Close();
+            }
+
+            autocompleteEditor = null;
+            autocompleteReplaceStart = -1;
+            autocompleteReplaceLength = 0;
+        }
+
+        private void AutocompleteListClick(object sender, EventArgs e)
+        {
+            if (autocompleteList != null && autocompleteList.SelectedIndex >= 0)
+            {
+                CommitAutocompleteSelection();
+            }
+        }
+
+        private void AutocompleteListDoubleClick(object sender, EventArgs e)
+        {
+            CommitAutocompleteSelection();
+        }
+
+        private void AutocompleteListMouseMove(object sender, MouseEventArgs e)
+        {
+            var index = autocompleteList == null ? -1 : autocompleteList.IndexFromPoint(e.Location);
+            if (autocompleteList != null && index >= 0 && index < autocompleteList.Items.Count)
+            {
+                autocompleteList.SelectedIndex = index;
+            }
         }
 
         private ThemePalette GetCurrentTheme()
@@ -2291,6 +3642,7 @@ namespace JzeroCompilerNativeLite
                 if (config != null && !string.IsNullOrWhiteSpace(config.Workspace))
                 {
                     workspacePath = config.Workspace;
+                    currentWorkspaceDirectory = workspacePath;
                 }
                 if (config != null && config.AutoClearTerminal.HasValue)
                 {
@@ -2454,6 +3806,34 @@ namespace JzeroCompilerNativeLite
         {
             internal string FullPath;
             internal bool IsDirectory;
+            internal bool IsParentLink;
+        }
+
+        private sealed class WorkspaceListView : ListView
+        {
+            internal WorkspaceListView()
+            {
+                DoubleBuffered = true;
+                SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+                UpdateStyles();
+            }
+
+            protected override void OnNotifyMessage(Message m)
+            {
+                const int WM_ERASEBKGND = 0x0014;
+                if (m.Msg != WM_ERASEBKGND)
+                {
+                    base.OnNotifyMessage(m);
+                }
+            }
+
+            internal void InvalidateHighlightRows()
+            {
+                for (int i = 0; i < Items.Count; i++)
+                {
+                    Invalidate(GetItemRect(i));
+                }
+            }
         }
 
         private sealed class EditorDocument
@@ -2463,6 +3843,16 @@ namespace JzeroCompilerNativeLite
             internal bool IsDirty;
             internal TabPage Page;
             internal FastColoredTextBox Editor;
+        }
+
+        private sealed class CompileRequest
+        {
+            internal EditorDocument Document;
+            internal string SourcePath;
+            internal string TempSourcePath;
+            internal string OriginalText;
+            internal string ExePath;
+            internal string WorkingDirectory;
         }
 
         private sealed class AppConfig

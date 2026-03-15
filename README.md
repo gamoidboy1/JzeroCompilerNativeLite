@@ -1,40 +1,58 @@
 # Jzero Compiler Native Lite 🚀
 
-**Jzero Compiler Native Lite** is a high-performance, resource-efficient C development environment. Built as a native WinForms alternative to the Electron-based JzeroCompiler, it delivers a premium IDE experience with a significantly lower RAM footprint.
+**Jzero Compiler Native Lite** is a high-performance, ultra-lightweight C development environment built for developers who demand speed, aesthetics, and efficiency. As a native WinForms alternative to Electron-based IDEs, it provides a premium "God Tier" experience with a microscopic RAM footprint.
 
 ---
 
-## ✨ Key Features
+## ✨ Why Native Lite?
 
-- **🚀 Ultra-Lightweight**: Designed for speed and RAM efficiency using native Windows components.
-- **💻 Multi-Tab Code Editor**: 
-    - Powerful syntax highlighting via `FastColoredTextBox`.
-    - Support for `.c`, `.h`, and `.txt` files.
-    - Persistent workspace that remembers your last session.
-- **📂 Integrated Workspace Explorer**:
-    - Full-featured tree-view for navigating projects.
-    - Quick search by both **File Name** and **File Content**.
-    - Effortless file management (Open, Auto-save, Create, Rename, Delete).
-- **🛠️ Built-in Compiler & Terminal**:
-    - Direct integration with `gcc` (MinGW).
-    - Streamed program output and interactive stdin support.
-    - One-click "Compile + Run" (`F5`).
-- **🎨 Modern Customization**:
-    - Multiple curated themes: **Forest**, **Ocean**, and more.
-    - Fully adjustable font settings for the editor and terminal output.
-    - Aesthetic dark-mode UI for reduced eye strain.
+While modern IDEs consume gigabytes of memory, **Jzero Native Lite** runs on a fraction of those resources. It is optimized for engineering students and professional developers who want a lag-free, responsive environment that starts instantly and stays out of your way.
+
+### 🔋 Extreme Efficiency
+- **75% Less RAM**: Enjoy a full IDE experience without slowing down your system.
+- **Native Performance**: Built with C# WinForms for maximum responsiveness.
+- **Zero Configuration**: No complex setup—just open and start coding.
+
+---
+
+## 💎 Best Features
+
+- **🚀 Lightning-Fast Startup**: Get from click to code in under a second.
+- **💻 Pro Multi-Tab Editor**: High-performance editor powered by `FastColoredTextBox` with C syntax highlighting.
+- **📂 Integrated Workspace Explorer**: 
+    - Smooth list-based file browser with breadcrumb navigation.
+    - Right-click actions: Open, Reveal in Explorer, Create, Rename, Delete.
+    - **Drag & Drop Move**: Reorganize your projects by simply dragging files into folders.
+- **🛠️ Built-in Compiler & Terminal**: 
+    - Full integration with `gcc` (MinGW) for seamless compilation.
+    - Interactive terminal with streamed output and stdin support.
+    - One-click "Compile + Run" (`F5`) or manual Stop control.
+- **🎨 Premium Customization**: 
+    - Multiple stunning themes including **Ocean**, **Amber**, **Forest**, **Carbon**, and more.
+    - Real-time preview of font and theme settings in a dedicated dialog.
+- **🧠 Smart Productivity**: 
+    - Basic Autocomplete (`Ctrl+Space`) to speed up your C coding.
+    - Persistent Session: Automatically restores your open tabs and workspace layout.
+    - Recent Files: Quick access to your latest work via the toolbar.
 
 ---
 
 ## 📸 Screenshots
 
-### Main Interface
-![Main Interface](screenshots/main_ui.png)
+### Modern Interface (Ocean Theme)
+![Main View](screenshots/main_view.png)
+
+### Integrated Workspace & Terminal
+![Workspace & Terminal](screenshots/workspace.png)
 
 ### Beautifully Themed Settings
-| Forest Theme | Ocean Theme |
-| :---: | :---: |
-| ![Forest Theme](screenshots/settings_forest.png) | ![Ocean Theme](screenshots/settings_ocean.png) |
+![Settings](screenshots/settings.png)
+
+### Amber Theme Showcase
+![Amber Theme](screenshots/amber_theme.png)
+
+### Mint Light Theme Showcase
+![Mint Theme](screenshots/mint_theme.png)
 
 ---
 
@@ -42,25 +60,31 @@
 
 | Shortcut | Action |
 | --- | --- |
-| `F5` | Compile + Run |
+| `F5` | Compile + Run (Restarts automatically if already running) |
+| `Ctrl + Space` | Trigger Autocomplete |
 | `Ctrl + S` | Save active file |
-| `Ctrl + W` | Close active tab |
+| `Ctrl + R` | Reload file from disk |
 | `Ctrl + B` | Show/Hide Workspace |
+| `Ctrl + W` | Close active tab |
 | `Ctrl + Z / Y` | Undo / Redo |
-| `Tab` | Smart Indentation |
 
 ---
 
-## 🛠️ How to Build
+## 🛠️ Getting Started
 
-To build the executable from source:
-1. Ensure you have the .NET Framework 4.0 or later installed.
-2. Run the `build.bat` script.
-3. The `JzeroCompilerNativeLite.exe` will be generated in the root directory.
+### Prerequisites
+- **MinGW (GCC)**: Ensure `gcc.exe` is installed at `C:\MinGW\bin\gcc.exe`.
 
-*Note: Requires MinGW (`C:\MinGW\bin\gcc.exe`) installed for code compilation.*
+### Installation
+1. Download the latest release.
+2. Run `JzeroCompilerNativeLite.exe`.
+3. Select your workspace folder and start coding!
+
+### Building from Source
+1. Ensure .NET Framework 4.0+ is installed.
+2. Run `build.bat`.
+3. The executable will be generated in the root directory.
 
 ---
 
-## 📝 Notes
-This version is optimized for stability and performance, replacing Monaco/xterm/Electron components with highly responsive native controls.
+Developed with ❤️ for the C community. Optimized for stability, performance, and beauty.
