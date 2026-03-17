@@ -73,7 +73,7 @@ namespace JzeroCompilerNativeLite
         private Label workspaceHintLabel;
         private TabControl editorTabs;
         private Panel emptyEditorPanel;
-        private HiddenScrollRichTextBox terminalBox;
+        private RichTextBox terminalBox;
         private SplitContainer workspaceSplit;
         private SplitContainer editorTerminalSplit;
         private Label statusLabel;
